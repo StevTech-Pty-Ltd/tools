@@ -153,6 +153,8 @@ class CliReporter(Reporter):
                     self._render()
 
     def _amount(self, done, total, unit) -> str:
+        if not total:
+            return "starting"
         if unit == "level":
             return f"level {int(done)}/{int(total)}"
         return f"{format_size(done)} / {format_size(total)}"
