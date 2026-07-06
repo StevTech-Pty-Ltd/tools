@@ -1,72 +1,49 @@
-# Spray Packager
+<div align="center">
 
-Desktop app that packages DJI Terra output for sending in: it takes the
-orthomosaic (**Result.tif**) and the sprayfile (**Segment.tif**), optimizes the
-orthomosaic for fast viewing in QGIS (JPEG-compressed tiled GeoTIFF with
-overview pyramids — the same treatment as the old `optimize_raster.sh`), and
-writes both into a single zip.
+# StevTech Tools
 
-No GDAL install needed: the GDAL engine ships inside the app via
-[rasterio](https://rasterio.readthedocs.io/).
+**Desktop utilities for working with [StevTech](https://stevtech.com.au) services.**
 
-## For operators (Windows)
+[![Build Spray Packager](https://github.com/StevTech-Pty-Ltd/tools/actions/workflows/build-spray-packager.yml/badge.svg)](https://github.com/StevTech-Pty-Ltd/tools/actions/workflows/build-spray-packager.yml)
 
-1. Double-click `SprayPackager.exe`.
-2. **Browse...** to the orthomosaic (usually `Result.tif`). If a `Segment.tif`
-   sits in the same folder, it is filled in automatically; the zip name is
-   suggested too.
-3. Adjust anything you like, then press **Create Package**.
-4. When it finishes, send the zip file it created.
+</div>
 
-The first launch can take ~20 seconds (the exe unpacks itself); later
-launches are faster.
+---
 
-## Building the Windows exe
+## Tools
 
-On any Windows machine with [Python 3.10+](https://www.python.org/downloads/)
-installed ("Add python.exe to PATH" ticked):
+| Tool | Description |
+| --- | --- |
+| [**Spray Packager**](tools/spray-packager) | Packages DJI Terra spray-drone output (`Result.tif` + `Segment.tif`) into a single optimized zip, ready to send to StevTech. |
 
-```bat
-build_windows.bat
-```
+## Installation
 
-The result is `dist\SprayPackager.exe` — a single file, distribute just that.
+Download the tool's `.exe` from the [latest release](../../releases/latest) and
+double-click it. No installer, no dependencies.
 
-## Running from source (any platform)
+> [!NOTE]
+> Windows SmartScreen may warn on first run — the binaries are not yet
+> code-signed. Choose **More info → Run anyway**.
+
+## Development
+
+Each tool is self-contained under `tools/<name>/` with its own README, tests,
+and build script.
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate          # Windows: .venv\Scripts\activate
+cd tools/spray-packager
+python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-python spray_packager.py           # GUI
+python spray_packager.py
 ```
 
-Headless / scripted use:
+Releases are built by CI — push a `<tool>-vX.Y.Z` tag and the workflow
+attaches the binary to a [GitHub Release](../../releases).
 
-```bash
-python spray_packager.py --result Result.tif --segment Segment.tif \
-    --zip package.zip --quality 40
-```
+## Support
 
-## What "optimize" does (parity with optimize_raster.sh)
+Contact your StevTech representative, or [open an issue](../../issues).
 
-| Step | Old script | This app |
-|---|---|---|
-| Compression | `COMPRESS=JPEG`, `JPEG_QUALITY=40`, `TILED=YES`, `BIGTIFF=YES` | Same (quality adjustable in the GUI) |
-| Nodata | `-a_nodata none` | Same (flag removed) |
-| Overviews | `gdaladdo -r average 2 ... 512` | Same, levels capped to the image size |
-| Extras | — | `PHOTOMETRIC=YCBCR` for 3-band images and JPEG-compressed overviews (both shrink the file further); non-8-bit input falls back to lossless DEFLATE instead of failing |
+## License
 
-The sprayfile is never recompressed — it goes into the zip byte-for-byte. The
-optimized orthomosaic is `STORED` in the zip (it is already JPEG-compressed;
-deflating it again would waste minutes for ~1% saving).
-
-## Tests
-
-```bash
-python tests/test_pipeline.py
-```
-
-Synthesizes a small orthomosaic + sprayfile and verifies the packaged output
-(JPEG, tiled, overviews, nodata cleared, georeferencing intact, sprayfile
-untouched).
+Free to use with StevTech products and services — see [LICENSE.md](LICENSE.md).

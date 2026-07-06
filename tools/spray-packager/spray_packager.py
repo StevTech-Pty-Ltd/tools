@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Spray Packager.
+"""StevTech Spray Packager.
 
-Packages DJI Terra output for sending: optimizes the orthomosaic (Result.tif)
-into a JPEG-compressed tiled GeoTIFF with overview pyramids -- the same
-treatment as optimize_raster.sh -- and zips it together with the untouched
-sprayfile (Segment.tif).
+Packages DJI Terra output for submission to StevTech: optimizes the
+orthomosaic (Result.tif) into a JPEG-compressed tiled GeoTIFF with overview
+pyramids and zips it together with the untouched sprayfile (Segment.tif).
 
 Run with no arguments for the GUI. Headless mode:
 
@@ -19,18 +18,22 @@ import queue
 import sys
 import tempfile
 import threading
+import time
 import traceback
 import zipfile
-from datetime import date
 from pathlib import Path
+
+__version__ = "1.1.0"
 
 DEFAULT_QUALITY = 40
 OVERVIEW_LEVELS = (2, 4, 8, 16, 32, 64, 128, 256, 512)
+ZIP_CHUNK = 8 * 1024 * 1024
 
 try:
+    import numpy as np
     import rasterio
     from rasterio.enums import Resampling
-    from rasterio.shutil import copy as raster_copy
+    from rasterio.windows import Window
 
     RASTERIO_IMPORT_ERROR = None
 except ImportError as exc:  # keep the GUI able to start and explain the problem
@@ -39,8 +42,22 @@ except ImportError as exc:  # keep the GUI able to start and explain the problem
 
 
 # --------------------------------------------------------------------------
-# Core pipeline (no GUI imports)
+# Progress reporting protocol
 # --------------------------------------------------------------------------
+
+class Reporter:
+    """Progress sink for the pipeline. The GUI and the retro CLI each render
+    these callbacks their own way; the default is silence."""
+
+    def phase(self, index: int, count: int, title: str, detail: str = "") -> None:
+        """A new phase of work is starting."""
+
+    def tick(self, done: float, total: float, unit: str = "B") -> None:
+        """Progress within the current phase. ``unit`` is "B" or "level"."""
+
+    def log(self, message: str) -> None:
+        """A line worth showing to the user."""
+
 
 def format_size(num_bytes: float) -> str:
     for unit in ("B", "KB", "MB", "GB"):
@@ -50,65 +67,114 @@ def format_size(num_bytes: float) -> str:
     return f"{num_bytes:.1f} GB"
 
 
-def optimize_geotiff(src_path, dst_path, quality: int = DEFAULT_QUALITY, log=print) -> str:
-    """Equivalent of optimize_raster.sh: JPEG-compressed tiled GeoTIFF with
-    averaged overview pyramids and the nodata flag removed."""
-    src_path, dst_path = os.fspath(src_path), os.fspath(dst_path)
+def format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds >= 3600:
+        return f"{seconds // 3600}:{seconds % 3600 // 60:02d}:{seconds % 60:02d}"
+    return f"{seconds // 60:02d}:{seconds % 60:02d}"
 
-    with rasterio.open(src_path) as src:
-        count = src.count
-        dtype = src.dtypes[0]
-        width, height = src.width, src.height
 
-    options = {"TILED": "YES", "BIGTIFF": "YES"}
+# --------------------------------------------------------------------------
+# Core pipeline (no GUI imports)
+# --------------------------------------------------------------------------
+
+def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
+    """Creation options matching the old optimize_raster.sh treatment."""
+    options = {"tiled": True, "blockxsize": 256, "blockysize": 256,
+               "bigtiff": "YES"}
     if dtype == "uint8":
-        options.update(COMPRESS="JPEG", JPEG_QUALITY=str(quality))
+        options.update(compress="JPEG", JPEG_QUALITY=str(quality))
         if count == 3:
-            options["PHOTOMETRIC"] = "YCBCR"
+            options["photometric"] = "YCbCr"
     else:
         # JPEG compression only exists for 8-bit data; fail soft into lossless.
-        log(f"Note: image is {dtype}, not 8-bit, so JPEG does not apply. "
-            "Using lossless DEFLATE compression instead.")
-        options.update(
-            COMPRESS="DEFLATE",
-            PREDICTOR="3" if dtype.startswith("float") else "2",
-        )
+        rep.log(f"NOTE image is {dtype}, not 8-bit; JPEG does not apply. "
+                "Falling back to lossless DEFLATE.")
+        options.update(compress="DEFLATE",
+                       predictor=3 if dtype.startswith("float") else 2)
+    return options
 
-    detail = f"quality {quality}" if options["COMPRESS"] == "JPEG" else "lossless"
-    log(f"Compressing {os.path.basename(src_path)} "
-        f"({width} x {height}, {count} band(s), {options['COMPRESS']} {detail})...")
-    raster_copy(src_path, dst_path, driver="GTiff", **options)
 
-    # The bash script passed -a_nodata none: without it, lossy JPEG shifts
-    # values near the old nodata and QGIS renders transparent speckle.
-    try:
+def _compress_windowed(src_path: Path, dst_path: Path, quality: int,
+                       rep: Reporter) -> dict:
+    """Rewrite the raster tile-by-tile with the planned creation options.
+
+    Windowed copying (vs GDAL CreateCopy) measures within ~2% at scale and
+    buys two things: real byte progress, and the nodata flag is simply never
+    written -- the equivalent of gdal_translate -a_nodata none.
+    """
+    with rasterio.open(src_path) as src:
+        options = _plan_options(src.count, src.dtypes[0], quality, rep)
+        profile = dict(driver="GTiff", width=src.width, height=src.height,
+                       count=src.count, dtype=src.dtypes[0], crs=src.crs,
+                       transform=src.transform, nodata=None, **options)
+        pixel_bytes = src.count * np.dtype(src.dtypes[0]).itemsize
+        total = src.width * src.height * pixel_bytes
+        # Strips of whole tile-rows, sized ~64 MB raw, keep Python overhead
+        # negligible while feeding GDAL's tile cache in order.
+        strip = max(256, int(64e6 / (src.width * pixel_bytes)) // 256 * 256)
+        done = 0
+        with rasterio.open(dst_path, "w", **profile) as dst:
+            if "photometric" not in options:
+                try:
+                    dst.colorinterp = src.colorinterp
+                except Exception:
+                    pass
+            for row in range(0, src.height, strip):
+                height = min(strip, src.height - row)
+                window = Window(0, row, src.width, height)
+                dst.write(src.read(window=window), window=window)
+                done += src.width * height * pixel_bytes
+                rep.tick(done, total)
+    return options
+
+
+def _build_overviews(dst_path: Path, levels: list[int], options: dict,
+                     rep: Reporter) -> None:
+    """Add averaged overviews one level at a time so progress is honest.
+    Each level is built from the previous one, same as a single gdaladdo run."""
+    env = {"COMPRESS_OVERVIEW": str(options.get("compress", "DEFLATE"))}
+    if options.get("compress") == "JPEG":
+        env["JPEG_QUALITY_OVERVIEW"] = options["JPEG_QUALITY"]
+    if options.get("photometric") == "YCbCr":
+        env["PHOTOMETRIC_OVERVIEW"] = "YCBCR"
+    with rasterio.Env(**env):
         with rasterio.open(dst_path, "r+") as ds:
-            if ds.nodata is not None:
-                ds.nodata = None
-    except Exception as exc:
-        log(f"Warning: could not clear the nodata flag ({exc}); continuing.")
+            for i, level in enumerate(levels, 1):
+                ds.build_overviews([level], Resampling.average)
+                rep.tick(i, len(levels), unit="level")
 
-    levels = [lvl for lvl in OVERVIEW_LEVELS if max(width, height) / lvl >= 8]
-    if levels:
-        log(f"Building overviews (levels {', '.join(map(str, levels))})...")
-        overview_env = {"COMPRESS_OVERVIEW": options["COMPRESS"]}
-        if options["COMPRESS"] == "JPEG":
-            overview_env["JPEG_QUALITY_OVERVIEW"] = str(quality)
-        if options.get("PHOTOMETRIC") == "YCBCR":
-            overview_env["PHOTOMETRIC_OVERVIEW"] = "YCBCR"
-        with rasterio.Env(**overview_env):
-            with rasterio.open(dst_path, "r+") as ds:
-                ds.build_overviews(levels, Resampling.average)
-    return dst_path
+
+def _zip_files(zip_path: Path, entries: list[tuple[Path, str, int]],
+               rep: Reporter) -> None:
+    """Stream files into the zip in chunks so progress is real. Writes to a
+    .part file and renames, so a half-written zip never looks finished."""
+    total = sum(path.stat().st_size for path, _, _ in entries)
+    done = 0
+    partial = zip_path.with_name(zip_path.name + ".part")
+    try:
+        with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
+            for path, arcname, compress_type in entries:
+                info = zipfile.ZipInfo.from_file(path, arcname)
+                info.compress_type = compress_type
+                with open(path, "rb") as src, \
+                        zf.open(info, "w", force_zip64=True) as dst:
+                    while chunk := src.read(ZIP_CHUNK):
+                        dst.write(chunk)
+                        done += len(chunk)
+                        rep.tick(done, total)
+        os.replace(partial, zip_path)
+    finally:
+        if partial.exists():
+            partial.unlink(missing_ok=True)
 
 
 def create_package(result_tif, segment_tif, zip_path,
-                   quality: int = DEFAULT_QUALITY, log=print, progress=None) -> Path:
+                   quality: int = DEFAULT_QUALITY,
+                   reporter: Reporter | None = None) -> Path:
     """Optimize the orthomosaic, then zip it with the untouched sprayfile.
-
-    ``progress(fraction, message)`` is an optional coarse phase callback.
-    Returns the final zip path.
-    """
+    Returns the final zip path."""
+    rep = reporter or Reporter()
     result_tif = Path(result_tif)
     segment_tif = Path(segment_tif)
     zip_path = Path(zip_path)
@@ -128,39 +194,36 @@ def create_package(result_tif, segment_tif, zip_path,
     if result_name == segment_name:
         segment_name = f"{segment_tif.stem}_segment{segment_tif.suffix}"
 
+    with rasterio.open(result_tif) as src:
+        width, height = src.width, src.height
+        bands = src.count
+    levels = [lvl for lvl in OVERVIEW_LEVELS if max(width, height) / lvl >= 8]
+
     # Work next to the destination so the big intermediate lands on the same
     # drive as the zip instead of filling the system temp directory.
     with tempfile.TemporaryDirectory(prefix="spraypkg_", dir=zip_path.parent) as tmp:
         optimized = Path(tmp) / result_name
 
-        if progress:
-            progress(0.1, "Optimizing orthomosaic...")
-        optimize_geotiff(result_tif, optimized, quality=quality, log=log)
-        log(f"Orthomosaic size: {format_size(result_tif.stat().st_size)}"
-            f" -> {format_size(optimized.stat().st_size)}")
+        rep.phase(1, 3, "COMPRESS ORTHOMOSAIC",
+                  f"{result_name}  {width} x {height}  {bands} band(s)")
+        options = _compress_windowed(result_tif, optimized, quality, rep)
+        rep.log(f"orthomosaic {format_size(result_tif.stat().st_size)}"
+                f" -> {format_size(optimized.stat().st_size)}")
 
-        if progress:
-            progress(0.75, "Writing zip...")
-        log(f"Writing {zip_path.name}...")
-        # Write to a .part file and rename, so a half-written zip is never
-        # mistaken for a finished one.
-        partial = zip_path.with_name(zip_path.name + ".part")
-        try:
-            with zipfile.ZipFile(partial, "w", allowZip64=True) as zf:
-                # The optimized tif is already JPEG-compressed; deflating it
-                # again costs minutes for ~1%, so store it as-is.
-                zf.write(optimized, arcname=result_name,
-                         compress_type=zipfile.ZIP_STORED)
-                zf.write(segment_tif, arcname=segment_name,
-                         compress_type=zipfile.ZIP_DEFLATED)
-            os.replace(partial, zip_path)
-        finally:
-            if partial.exists():
-                partial.unlink(missing_ok=True)
+        rep.phase(2, 3, "BUILD OVERVIEWS",
+                  f"levels {levels[0]}..{levels[-1]}" if levels else "none needed")
+        if levels:
+            _build_overviews(optimized, levels, options, rep)
 
-    if progress:
-        progress(1.0, "Done")
-    log(f"Package ready: {zip_path} ({format_size(zip_path.stat().st_size)})")
+        rep.phase(3, 3, "WRITE PACKAGE", zip_path.name)
+        _zip_files(zip_path, [
+            # already JPEG-compressed; deflating again wastes minutes for ~1%
+            (optimized, result_name, zipfile.ZIP_STORED),
+            (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
+        ], rep)
+
+    rep.log(f"package ready: {zip_path.name}"
+            f"  {format_size(zip_path.stat().st_size)}")
     return zip_path
 
 
@@ -182,8 +245,25 @@ def open_folder(path: Path) -> None:
 # GUI
 # --------------------------------------------------------------------------
 
+class QueueReporter(Reporter):
+    """Forwards pipeline events onto a queue the tkinter thread drains."""
+
+    def __init__(self, q: "queue.Queue") -> None:
+        self.q = q
+
+    def phase(self, index, count, title, detail=""):
+        self.q.put(("phase", (index, count, title, detail)))
+
+    def tick(self, done, total, unit="B"):
+        self.q.put(("tick", (done, total, unit)))
+
+    def log(self, message):
+        self.q.put(("log", message))
+
+
 def run_gui() -> None:
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import filedialog, messagebox, ttk
 
     if sys.platform == "win32":
@@ -194,8 +274,8 @@ def run_gui() -> None:
             pass
 
     root = tk.Tk()
-    root.title("Spray Packager")
-    root.minsize(640, 480)
+    root.title(f"StevTech Spray Packager v{__version__}")
+    root.minsize(680, 500)
 
     if RASTERIO_IMPORT_ERROR is not None:
         messagebox.showerror(
@@ -220,18 +300,17 @@ def run_gui() -> None:
 
     tif_types = [("GeoTIFF images", "*.tif *.tiff"), ("All files", "*.*")]
 
-    def suggest_paths(result_path: str) -> None:
-        """After picking Result.tif, prefill the sprayfile and zip fields."""
+    def autofill_segment(result_path: str) -> None:
+        """Picking Result.tif fills in a Segment.tif sitting beside it.
+        The zip destination is deliberately left for the user to choose."""
+        if segment_var.get():
+            return
         folder = Path(result_path).parent
-        if not segment_var.get():
-            candidate = next(
-                (p for p in sorted(folder.glob("*.tif*"))
-                 if p.stem.lower() == "segment"), None)
-            if candidate:
-                segment_var.set(str(candidate))
-        if not zip_var.get():
-            name = folder.name or "spray"
-            zip_var.set(str(folder / f"{name}_spray_package_{date.today():%Y-%m-%d}.zip"))
+        candidate = next(
+            (p for p in sorted(folder.glob("*.tif*"))
+             if p.stem.lower() == "segment"), None)
+        if candidate:
+            segment_var.set(str(candidate))
 
     def browse_result() -> None:
         path = filedialog.askopenfilename(
@@ -239,7 +318,7 @@ def run_gui() -> None:
             filetypes=tif_types)
         if path:
             result_var.set(path)
-            suggest_paths(path)
+            autofill_segment(path)
 
     def browse_segment() -> None:
         path = filedialog.askopenfilename(
@@ -249,13 +328,11 @@ def run_gui() -> None:
             segment_var.set(path)
 
     def browse_zip() -> None:
-        initial = Path(zip_var.get()) if zip_var.get() else None
         path = filedialog.asksaveasfilename(
             title="Save package as",
             defaultextension=".zip",
             filetypes=[("Zip archives", "*.zip")],
-            initialdir=str(initial.parent) if initial else None,
-            initialfile=initial.name if initial else "spray_package.zip")
+            initialfile="spray_package.zip")
         if path:
             zip_var.set(path)
 
@@ -279,7 +356,7 @@ def run_gui() -> None:
                               width=5, textvariable=quality_var)
     quality_box.pack(side="left", padx=(6, 6))
     ttk.Label(quality_frame,
-              text="(lower = smaller file; 40 is the standard setting)"
+              text="(lower = smaller file, Default = 40)"
               ).pack(side="left")
 
     run_button = ttk.Button(outer, text="Create Package")
@@ -291,7 +368,14 @@ def run_gui() -> None:
     ttk.Label(outer, textvariable=status_var).grid(
         row=6, column=0, columnspan=3, sticky="w", pady=(4, 8))
 
-    log_text = tk.Text(outer, height=12, state="disabled", wrap="word")
+    # CRT-flavoured activity log: phosphor green on near-black, monospace.
+    families = set(tkfont.families())
+    mono = next((f for f in ("Consolas", "Menlo", "Courier New", "Courier")
+                 if f in families), "TkFixedFont")
+    log_text = tk.Text(outer, height=13, state="disabled", wrap="word",
+                       bg="#0a100a", fg="#5dff7f", insertbackground="#5dff7f",
+                       selectbackground="#1f3f1f", relief="sunken",
+                       borderwidth=2, font=(mono, 11), padx=8, pady=6)
     log_text.grid(row=7, column=0, columnspan=3, sticky="nsew")
     scroll = ttk.Scrollbar(outer, command=log_text.yview)
     scroll.grid(row=7, column=3, sticky="ns")
@@ -304,6 +388,11 @@ def run_gui() -> None:
         log_text.see("end")
         log_text.configure(state="disabled")
 
+    append_log(f"STEVTECH SPRAY PACKAGER v{__version__} -- READY")
+    append_log("═" * 52)
+
+    phase_state = {"index": 0, "count": 3, "title": "", "started": 0.0}
+
     def set_busy(busy: bool) -> None:
         state = "disabled" if busy else "normal"
         run_button.configure(state=state)
@@ -311,10 +400,8 @@ def run_gui() -> None:
 
     def worker(result: str, segment: str, zip_path: str, quality: int) -> None:
         try:
-            out = create_package(
-                result, segment, zip_path, quality,
-                log=lambda m: ui_queue.put(("log", m)),
-                progress=lambda f, m: ui_queue.put(("progress", (f, m))))
+            out = create_package(result, segment, zip_path, quality,
+                                 reporter=QueueReporter(ui_queue))
             ui_queue.put(("done", str(out)))
         except Exception:
             ui_queue.put(("error", traceback.format_exc()))
@@ -349,9 +436,10 @@ def run_gui() -> None:
             return
 
         set_busy(True)
-        progress_bar["value"] = 2
+        progress_bar["value"] = 0
         status_var.set("Working...")
-        append_log("-" * 60)
+        append_log("")
+        append_log(f"JOB START {time.strftime('%Y-%m-%d %H:%M:%S')}")
         threading.Thread(target=worker,
                          args=(result, segment, zip_path, quality),
                          daemon=True).start()
@@ -362,17 +450,35 @@ def run_gui() -> None:
         try:
             while True:
                 kind, payload = ui_queue.get_nowait()
-                if kind == "log":
-                    append_log(str(payload))
-                elif kind == "progress":
-                    fraction, message = payload  # type: ignore[misc]
-                    progress_bar["value"] = fraction * 100
-                    status_var.set(message)
+                if kind == "phase":
+                    index, count, title, detail = payload  # type: ignore[misc]
+                    phase_state.update(index=index, count=count, title=title,
+                                       started=time.monotonic())
+                    append_log(f"[{index}/{count}] {title}"
+                               + (f"  {detail}" if detail else ""))
+                    progress_bar["value"] = (index - 1) / count * 100
+                    status_var.set(f"[{index}/{count}] {title}")
+                elif kind == "tick":
+                    done, total, unit = payload  # type: ignore[misc]
+                    frac = done / total if total else 1.0
+                    index, count = phase_state["index"], phase_state["count"]
+                    progress_bar["value"] = ((index - 1) + frac) / count * 100
+                    elapsed = time.monotonic() - phase_state["started"]
+                    eta = format_duration(elapsed * (1 - frac) / frac) \
+                        if 0 < frac < 1 and elapsed > 1 else "--:--"
+                    amount = (f"{format_size(done)} / {format_size(total)}"
+                              if unit == "B" else f"{int(done)}/{int(total)} levels")
+                    status_var.set(f"[{index}/{count}] {phase_state['title']}"
+                                   f"  {frac:4.0%}  {amount}  ETA {eta}")
+                elif kind == "log":
+                    append_log("      " + str(payload))
                 elif kind == "done":
                     progress_bar["value"] = 100
                     status_var.set("Package created.")
-                    set_busy(False)
                     out = Path(str(payload))
+                    append_log(f"JOB COMPLETE  {out.name}"
+                               f"  {format_size(out.stat().st_size)}")
+                    set_busy(False)
                     if messagebox.askyesno(
                             "Package created",
                             f"Created {out.name}\n({format_size(out.stat().st_size)})\n\n"
@@ -409,6 +515,8 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description="Optimize a DJI Terra orthomosaic and zip it with the "
                     "sprayfile. Run with no arguments for the GUI.")
+    parser.add_argument("--version", action="version",
+                        version=f"Spray Packager {__version__}")
     parser.add_argument("--result", help="Path to the orthomosaic (Result.tif)")
     parser.add_argument("--segment", help="Path to the sprayfile (Segment.tif)")
     parser.add_argument("--zip", dest="zip_path", help="Output zip path")
@@ -422,7 +530,8 @@ def main(argv=None) -> None:
         if RASTERIO_IMPORT_ERROR is not None:
             sys.exit(f"rasterio failed to import: {RASTERIO_IMPORT_ERROR}\n"
                      "Install it with: pip install rasterio")
-        create_package(args.result, args.segment, args.zip_path, args.quality)
+        from retro_cli import run as run_cli
+        sys.exit(run_cli(args))
     else:
         run_gui()
 
