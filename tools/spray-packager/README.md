@@ -31,12 +31,40 @@ pip install -r requirements.txt
 python spray_packager.py           # GUI
 ```
 
-Headless / scripted use:
+Headless / scripted use (retro terminal UI — live progress bars, ETAs, and a
+job banner on a real terminal; plain milestone lines when piped or in CI):
 
 ```bash
 python spray_packager.py --result Result.tif --segment Segment.tif \
     --zip package.zip --quality 40
 ```
+
+```text
+╔════════════════════════════════════════════════════════════════╗
+║  S T E V T E C H   S P R A Y   P A C K A G E R                 ║
+║  field package preparation system  v1.1.0                      ║
+╚════════════════════════════════════════════════════════════════╝
+  JOB START  2026-07-06 15:04:22
+  INPUT   Result.tif                   441.2 MB
+  INPUT   Segment.tif                  2.1 MB
+  OUTPUT  package.zip
+
+ [1/3] COMPRESS ORTHOMOSAIC   Result.tif  21360 x 18400  3 band(s)
+   / ██████████████░░░░░░░░░░░░  54%  238.1 MB / 441.2 MB  ETA 00:19
+```
+
+Return codes (also printed as `RC=` in the job trailer):
+
+| RC | Meaning |
+|---|---|
+| 0 | OK |
+| 2 | Input file not found |
+| 3 | Invalid input (bad quality value, same file twice, not a GeoTIFF) |
+| 4 | Processing failure (unreadable/corrupt orthomosaic) |
+| 5 | Packaging failure (destination not writable / out of disk) |
+| 130 | Cancelled with Ctrl-C |
+
+Set `SPK_DEBUG=1` for a full traceback on failure.
 
 ## What "optimize" does
 

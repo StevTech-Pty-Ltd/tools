@@ -119,7 +119,45 @@ def test_non_uint8_falls_back_to_deflate() -> None:
     print("PASS: non-uint8 fallback to DEFLATE")
 
 
+def test_cli_return_codes() -> None:
+    """The retro CLI must exit 0 on success (with a JOB COMPLETE line) and
+    with the documented RC=2 when an input file is missing."""
+    import subprocess
+    script = Path(__file__).resolve().parents[1] / "spray_packager.py"
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        result = tmp / "Result.tif"
+        segment = tmp / "Segment.tif"
+        make_ortho(result, width=512, height=512)
+        make_segment(segment)
+
+        ok = subprocess.run(
+            [sys.executable, str(script), "--result", str(result),
+             "--segment", str(segment), "--zip", str(tmp / "pkg.zip")],
+            capture_output=True, text=True)
+        assert ok.returncode == 0, ok.stdout + ok.stderr
+        assert "JOB COMPLETE" in ok.stdout, ok.stdout
+        assert (tmp / "pkg.zip").is_file()
+
+        missing = subprocess.run(
+            [sys.executable, str(script), "--result", str(tmp / "nope.tif"),
+             "--segment", str(segment), "--zip", str(tmp / "pkg2.zip")],
+            capture_output=True, text=True)
+        assert missing.returncode == 2, (missing.returncode, missing.stdout)
+        assert "RC=2" in missing.stdout, missing.stdout
+
+        bad_quality = subprocess.run(
+            [sys.executable, str(script), "--result", str(result),
+             "--segment", str(segment), "--zip", str(tmp / "pkg3.zip"),
+             "--quality", "99"],
+            capture_output=True, text=True)
+        assert bad_quality.returncode == 3, bad_quality.stdout
+
+    print("PASS: CLI return codes")
+
+
 if __name__ == "__main__":
     test_create_package()
     test_non_uint8_falls_back_to_deflate()
+    test_cli_return_codes()
     print("All tests passed.")
