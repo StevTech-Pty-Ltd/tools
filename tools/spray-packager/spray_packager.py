@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
-"""Spray Packager.
+"""StevTech Spray Packager.
 
-Packages DJI Terra output for sending: optimizes the orthomosaic (Result.tif)
-into a JPEG-compressed tiled GeoTIFF with overview pyramids -- the same
-treatment as optimize_raster.sh -- and zips it together with the untouched
-sprayfile (Segment.tif).
+Packages DJI Terra output for submission to StevTech: optimizes the
+orthomosaic (Result.tif) into a JPEG-compressed tiled GeoTIFF with overview
+pyramids and zips it together with the untouched sprayfile (Segment.tif).
 
 Run with no arguments for the GUI. Headless mode:
 
@@ -23,6 +22,8 @@ import traceback
 import zipfile
 from datetime import date
 from pathlib import Path
+
+__version__ = "1.0.0"
 
 DEFAULT_QUALITY = 40
 OVERVIEW_LEVELS = (2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -194,7 +195,7 @@ def run_gui() -> None:
             pass
 
     root = tk.Tk()
-    root.title("Spray Packager")
+    root.title(f"StevTech Spray Packager v{__version__}")
     root.minsize(640, 480)
 
     if RASTERIO_IMPORT_ERROR is not None:
@@ -409,6 +410,8 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description="Optimize a DJI Terra orthomosaic and zip it with the "
                     "sprayfile. Run with no arguments for the GUI.")
+    parser.add_argument("--version", action="version",
+                        version=f"Spray Packager {__version__}")
     parser.add_argument("--result", help="Path to the orthomosaic (Result.tif)")
     parser.add_argument("--segment", help="Path to the sprayfile (Segment.tif)")
     parser.add_argument("--zip", dest="zip_path", help="Output zip path")
