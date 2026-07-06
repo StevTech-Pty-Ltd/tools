@@ -356,7 +356,7 @@ def run_gui() -> None:
                               width=5, textvariable=quality_var)
     quality_box.pack(side="left", padx=(6, 6))
     ttk.Label(quality_frame,
-              text="(lower = smaller file; 40 is the standard setting)"
+              text="(lower = smaller file, Default = 40)"
               ).pack(side="left")
 
     run_button = ttk.Button(outer, text="Create Package")
