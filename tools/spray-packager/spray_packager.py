@@ -350,7 +350,7 @@ def run_gui() -> None:
 
     def browse_result() -> None:
         path = filedialog.askopenfilename(
-            title="Select the orthomosaic (usually Result.tif)",
+            title="Select the orthomosaic (usually result.tif)",
             filetypes=tif_types)
         if path:
             result_var.set(path)
@@ -358,7 +358,7 @@ def run_gui() -> None:
 
     def browse_segment() -> None:
         path = filedialog.askopenfilename(
-            title="Select the sprayfile (usually Segment.tif)",
+            title="Select the spray file (usually segment.tif)",
             filetypes=tif_types)
         if path:
             segment_var.set(path)
@@ -373,16 +373,16 @@ def run_gui() -> None:
             zip_var.set(path)
 
     rows = [
-        ("Orthomosaic (Result.tif)", result_var, browse_result),
-        ("Sprayfile (Segment.tif)", segment_var, browse_segment),
-        ("Save package as (.zip)", zip_var, browse_zip),
+        ("Orthomosaic (result.tif)", result_var, browse_result, "Browse..."),
+        ("Spray File (segment.tif)", segment_var, browse_segment, "Browse..."),
+        ("Output Spray Package (.zip)", zip_var, browse_zip, "Save As"),
     ]
-    for row, (label, var, handler) in enumerate(rows):
+    for row, (label, var, handler, button_label) in enumerate(rows):
         ttk.Label(outer, text=label).grid(row=row, column=0, sticky="w",
                                           pady=4, padx=(0, 8))
         ttk.Entry(outer, textvariable=var).grid(row=row, column=1,
                                                 sticky="ew", pady=4)
-        ttk.Button(outer, text="Browse...", command=handler).grid(
+        ttk.Button(outer, text=button_label, command=handler).grid(
             row=row, column=2, padx=(8, 0), pady=4)
 
     quality_frame = ttk.Frame(outer)
@@ -392,7 +392,7 @@ def run_gui() -> None:
                               width=5, textvariable=quality_var)
     quality_box.pack(side="left", padx=(6, 6))
     ttk.Label(quality_frame,
-              text="(lower = smaller file, Default = 40)"
+              text="(Default = 40)"
               ).pack(side="left")
 
     run_button = ttk.Button(outer, text="Create Package")
@@ -451,7 +451,7 @@ def run_gui() -> None:
         if not result or not Path(result).is_file():
             problems.append("Select the orthomosaic (Result.tif).")
         if not segment or not Path(segment).is_file():
-            problems.append("Select the sprayfile (Segment.tif).")
+            problems.append("Select the spray file (Segment.tif).")
         if result and segment and result == segment:
             problems.append("Result and Segment must be different files.")
         if not zip_path:
@@ -550,11 +550,11 @@ def run_gui() -> None:
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
         description="Optimize a DJI Terra orthomosaic and zip it with the "
-                    "sprayfile. Run with no arguments for the GUI.")
+                    "spray file. Run with no arguments for the GUI.")
     parser.add_argument("--version", action="version",
                         version=f"Spray Packager {__version__}")
     parser.add_argument("--result", help="Path to the orthomosaic (Result.tif)")
-    parser.add_argument("--segment", help="Path to the sprayfile (Segment.tif)")
+    parser.add_argument("--segment", help="Path to the spray file (Segment.tif)")
     parser.add_argument("--zip", dest="zip_path", help="Output zip path")
     parser.add_argument("--quality", type=int, default=DEFAULT_QUALITY,
                         help=f"JPEG quality (default {DEFAULT_QUALITY})")
