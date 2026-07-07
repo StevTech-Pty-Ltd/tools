@@ -23,7 +23,7 @@ import traceback
 import zipfile
 from pathlib import Path
 
-__version__ = "1.1.0"
+__version__ = "1.1.1"
 
 DEFAULT_QUALITY = 40
 OVERVIEW_LEVELS = (2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -79,12 +79,23 @@ def format_duration(seconds: float) -> str:
 # --------------------------------------------------------------------------
 
 def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
-    """Creation options matching the old optimize_raster.sh treatment."""
+    """Creation options matching the old optimize_raster.sh treatment.
+
+    A 4-band uint8 raster is DJI Terra's RGB + alpha. JPEG cannot use the
+    efficient YCbCr colour transform on 4 bands, so those orthos compress
+    several times worse if left as-is. We instead write the 3 colour bands as
+    YCbCr JPEG and carry the alpha as an internal 1-bit mask (transparency is
+    preserved for QGIS). ``out_count`` and ``use_mask`` describe that plan.
+    """
     options = {"tiled": True, "blockxsize": 256, "blockysize": 256,
                "bigtiff": "YES"}
+    out_count, use_mask = count, False
     if dtype == "uint8":
         options.update(compress="JPEG", JPEG_QUALITY=str(quality))
-        if count == 3:
+        if count == 4:
+            out_count, use_mask = 3, True
+            options["photometric"] = "YCbCr"
+        elif count == 3:
             options["photometric"] = "YCbCr"
     else:
         # JPEG compression only exists for 8-bit data; fail soft into lossless.
@@ -92,7 +103,7 @@ def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
                 "Falling back to lossless DEFLATE.")
         options.update(compress="DEFLATE",
                        predictor=3 if dtype.startswith("float") else 2)
-    return options
+    return {"options": options, "out_count": out_count, "use_mask": use_mask}
 
 
 def _compress_windowed(src_path: Path, dst_path: Path, quality: int,
@@ -101,20 +112,26 @@ def _compress_windowed(src_path: Path, dst_path: Path, quality: int,
 
     Windowed copying (vs GDAL CreateCopy) measures within ~2% at scale and
     buys two things: real byte progress, and the nodata flag is simply never
-    written -- the equivalent of gdal_translate -a_nodata none.
+    written -- the equivalent of gdal_translate -a_nodata none. Returns the
+    plan dict (options + mask flag) that overview building needs.
     """
     with rasterio.open(src_path) as src:
-        options = _plan_options(src.count, src.dtypes[0], quality, rep)
+        plan = _plan_options(src.count, src.dtypes[0], quality, rep)
+        options, out_count, use_mask = (
+            plan["options"], plan["out_count"], plan["use_mask"])
         profile = dict(driver="GTiff", width=src.width, height=src.height,
-                       count=src.count, dtype=src.dtypes[0], crs=src.crs,
+                       count=out_count, dtype=src.dtypes[0], crs=src.crs,
                        transform=src.transform, nodata=None, **options)
         pixel_bytes = src.count * np.dtype(src.dtypes[0]).itemsize
         total = src.width * src.height * pixel_bytes
         # Strips of whole tile-rows, sized ~64 MB raw, keep Python overhead
         # negligible while feeding GDAL's tile cache in order.
         strip = max(256, int(64e6 / (src.width * pixel_bytes)) // 256 * 256)
+        colour_bands = list(range(1, out_count + 1))
         done = 0
-        with rasterio.open(dst_path, "w", **profile) as dst:
+        # Internal mask so the alpha rides inside the single .tif.
+        env = {"GDAL_TIFF_INTERNAL_MASK": "YES"} if use_mask else {}
+        with rasterio.Env(**env), rasterio.open(dst_path, "w", **profile) as dst:
             if "photometric" not in options:
                 try:
                     dst.colorinterp = src.colorinterp
@@ -123,26 +140,37 @@ def _compress_windowed(src_path: Path, dst_path: Path, quality: int,
             for row in range(0, src.height, strip):
                 height = min(strip, src.height - row)
                 window = Window(0, row, src.width, height)
-                dst.write(src.read(window=window), window=window)
+                dst.write(src.read(colour_bands, window=window), window=window)
+                if use_mask:
+                    dst.write_mask(src.read(src.count, window=window),
+                                   window=window)
                 done += src.width * height * pixel_bytes
                 rep.tick(done, total)
-    return options
+    return plan
 
 
-def _build_overviews(dst_path: Path, levels: list[int], options: dict,
+def _build_overviews(dst_path: Path, levels: list[int], plan: dict,
                      rep: Reporter) -> None:
-    """Add averaged overviews one level at a time so progress is honest.
-    Each level is built from the previous one, same as a single gdaladdo run."""
+    """Add averaged overviews in a single cascaded pass.
+
+    One ``build_overviews(levels)`` call builds each level from the previous
+    (like a single gdaladdo run). Calling it once per level instead re-reads
+    the full-resolution base every time -- ~5x slower on large orthos, which
+    looks like a hang right after compression hits 100%.
+    """
+    options = plan["options"]
     env = {"COMPRESS_OVERVIEW": str(options.get("compress", "DEFLATE"))}
     if options.get("compress") == "JPEG":
         env["JPEG_QUALITY_OVERVIEW"] = options["JPEG_QUALITY"]
     if options.get("photometric") == "YCbCr":
         env["PHOTOMETRIC_OVERVIEW"] = "YCBCR"
+    if plan["use_mask"]:
+        env["GDAL_TIFF_INTERNAL_MASK"] = "YES"  # build mask overviews too
+    rep.tick(0, len(levels), unit="level")
     with rasterio.Env(**env):
         with rasterio.open(dst_path, "r+") as ds:
-            for i, level in enumerate(levels, 1):
-                ds.build_overviews([level], Resampling.average)
-                rep.tick(i, len(levels), unit="level")
+            ds.build_overviews(levels, Resampling.average)
+    rep.tick(len(levels), len(levels), unit="level")
 
 
 def _zip_files(zip_path: Path, entries: list[tuple[Path, str, int]],
@@ -206,14 +234,22 @@ def create_package(result_tif, segment_tif, zip_path,
 
         rep.phase(1, 3, "COMPRESS ORTHOMOSAIC",
                   f"{result_name}  {width} x {height}  {bands} band(s)")
-        options = _compress_windowed(result_tif, optimized, quality, rep)
-        rep.log(f"orthomosaic {format_size(result_tif.stat().st_size)}"
-                f" -> {format_size(optimized.stat().st_size)}")
+        plan = _compress_windowed(result_tif, optimized, quality, rep)
+        # Note: the optimized size here is the compressed base; overviews
+        # (phase 2) add it back on top, so the final zip is a little larger.
+        orig = result_tif.stat().st_size
+        comp = optimized.stat().st_size
+        ratio = orig / comp if comp else 0
+        method = ("DEFLATE lossless"
+                  if plan["options"].get("compress") == "DEFLATE"
+                  else f"JPEG q{quality}")
+        rep.log(f"orthomosaic compressed {format_size(orig)}"
+                f" -> {format_size(comp)}  ({ratio:.0f}x smaller, {method})")
 
         rep.phase(2, 3, "BUILD OVERVIEWS",
                   f"levels {levels[0]}..{levels[-1]}" if levels else "none needed")
         if levels:
-            _build_overviews(optimized, levels, options, rep)
+            _build_overviews(optimized, levels, plan, rep)
 
         rep.phase(3, 3, "WRITE PACKAGE", zip_path.name)
         _zip_files(zip_path, [

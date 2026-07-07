@@ -12,12 +12,17 @@ Run directly (no pytest needed):  python tests/test_pipeline.py
 import hashlib
 import sys
 import tempfile
+import warnings
 import zipfile
 from pathlib import Path
 
 import numpy as np
 import rasterio
 from rasterio.transform import from_origin
+
+# rasterio 1.5 + numpy 2.5 emit a deprecation from read_masks internals; not
+# ours and not a behaviour we control.
+warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spray_packager import create_package  # noqa: E402
@@ -33,6 +38,29 @@ def make_ortho(path: Path, width=1024, height=768) -> None:
             path, "w", driver="GTiff", width=width, height=height, count=3,
             dtype="uint8", crs=CRS, transform=transform, nodata=0) as dst:
         dst.write(data)
+
+
+def make_ortho_rgba(path: Path, width=1024, height=768) -> None:
+    """A DJI-Terra-style 4-band RGBA orthomosaic: photographic-ish content in
+    RGB with a circular valid region, and an alpha band marking the valid
+    area (0 = transparent border, 255 = valid) instead of a nodata flag."""
+    transform = from_origin(500000.0, 6000000.0, 0.05, 0.05)
+    rng = np.random.default_rng(3)
+    yy, xx = np.mgrid[0:height, 0:width]
+    base = (np.sin(xx / 40.0) * 40 + np.cos(yy / 55.0) * 40 + 128).astype(np.uint8)
+    valid = np.sqrt((yy - height / 2) ** 2 + (xx - width / 2) ** 2) < width * 0.45
+    data = np.zeros((4, height, width), dtype=np.uint8)
+    for b in range(3):
+        data[b] = np.clip(base + rng.integers(-10, 10, (height, width)), 0, 255)
+        data[b][~valid] = 0
+    data[3] = np.where(valid, 255, 0).astype(np.uint8)
+    with rasterio.open(
+            path, "w", driver="GTiff", width=width, height=height, count=4,
+            dtype="uint8", crs=CRS, transform=transform) as dst:
+        dst.write(data)
+        dst.colorinterp = [
+            rasterio.enums.ColorInterp.red, rasterio.enums.ColorInterp.green,
+            rasterio.enums.ColorInterp.blue, rasterio.enums.ColorInterp.alpha]
 
 
 def make_segment(path: Path, size=200) -> None:
@@ -156,8 +184,56 @@ def test_cli_return_codes() -> None:
     print("PASS: CLI return codes")
 
 
+def test_rgba_uses_ycbcr_and_mask() -> None:
+    """A 4-band RGBA orthomosaic (DJI Terra's standard output) must be
+    packaged as a 3-band YCbCr-JPEG with the alpha carried as an internal
+    mask -- not as a 4-band JPEG, which cannot use YCbCr and compresses
+    several times worse. The valid-data area must survive as a mask so QGIS
+    still renders transparency, including at overview resolution."""
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        result = tmp / "Result.tif"
+        segment = tmp / "Segment.tif"
+        out_zip = tmp / "pkg.zip"
+        make_ortho_rgba(result, width=2048, height=1536)
+        make_segment(segment)
+
+        create_package(result, segment, out_zip, quality=40)
+
+        extract = tmp / "x"
+        with zipfile.ZipFile(out_zip) as zf:
+            zf.extractall(extract)
+
+        with rasterio.open(extract / "Result.tif") as ds:
+            assert ds.count == 3, f"expected 3 colour bands, got {ds.count}"
+            assert ds.compression is not None and \
+                ds.compression.value.lower() == "jpeg", ds.compression
+            assert ds.photometric is not None and \
+                ds.photometric.value.lower() == "ycbcr", ds.photometric
+            # alpha preserved as a per-dataset mask (transparency for QGIS)
+            assert rasterio.enums.MaskFlags.per_dataset in ds.mask_flag_enums[0], \
+                ds.mask_flag_enums[0]
+            valid_frac = (ds.read_masks(1) > 0).mean()
+            assert 0.4 < valid_frac < 0.9, f"mask valid fraction off: {valid_frac}"
+            # overviews cover the mask too, so zoomed-out transparency is right
+            assert ds.overviews(1), "no overviews built"
+        with rasterio.open(extract / "Result.tif", OVERVIEW_LEVEL=1) as ov:
+            ov_valid = (ov.read_masks(1) > 0).mean()
+            assert 0.3 < ov_valid < 0.95, f"overview mask lost: {ov_valid}"
+
+        # efficient: a 4-band no-YCbCr JPEG of this content is >3x larger
+        opt_size = None
+        with zipfile.ZipFile(out_zip) as zf:
+            opt_size = zf.getinfo("Result.tif").file_size
+        assert opt_size < result.stat().st_size / 8, \
+            f"weak compression: {opt_size} vs {result.stat().st_size}"
+
+    print("PASS: RGBA uses YCbCr + mask")
+
+
 if __name__ == "__main__":
     test_create_package()
     test_non_uint8_falls_back_to_deflate()
+    test_rgba_uses_ycbcr_and_mask()
     test_cli_return_codes()
     print("All tests passed.")
