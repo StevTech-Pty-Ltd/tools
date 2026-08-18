@@ -197,14 +197,17 @@ def _zip_files(zip_path: Path, entries: list[tuple[Path, str, int]],
             partial.unlink(missing_ok=True)
 
 
-def create_package(result_tif, segment_tif, zip_path,
+def create_package(result_tif_path, segment_tif_path, zip_path,
                    quality: int = DEFAULT_QUALITY,
                    reporter: Reporter | None = None) -> Path:
     """Optimize the orthomosaic, then zip it with the untouched sprayfile.
     Returns the final zip path."""
     rep = reporter or Reporter()
-    result_tif = Path(result_tif)
-    segment_tif = Path(segment_tif)
+    result_tif = Path(result_tif_path)
+    result_tfw = Path(f"{result_tif_path[0:len(result_tif_path)-4]}.tfw")
+    result_prj = Path(f"{result_tif_path[0:len(result_tif_path)-4]}.prj")
+    segment_tif = Path(segment_tif_path)
+    segment_tfw = Path(f"{segment_tif_path[0:len(segment_tif_path)-4]}.tfw")
     zip_path = Path(zip_path)
 
     for label, path in (("Orthomosaic (Result)", result_tif),
@@ -255,7 +258,10 @@ def create_package(result_tif, segment_tif, zip_path,
         _zip_files(zip_path, [
             # already JPEG-compressed; deflating again wastes minutes for ~1%
             (optimized, result_name, zipfile.ZIP_STORED),
+            (result_tfw, result_tfw.name, zipfile.ZIP_DEFLATED),
+            (result_prj, result_prj.name, zipfile.ZIP_DEFLATED),
             (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
+            (segment_tfw, segment_tfw.name, zipfile.ZIP_DEFLATED),
         ], rep)
 
     rep.log(f"package ready: {zip_path.name}"
