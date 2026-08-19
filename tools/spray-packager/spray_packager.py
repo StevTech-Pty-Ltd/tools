@@ -23,7 +23,7 @@ import traceback
 import zipfile
 from pathlib import Path
 
-__version__ = "1.1.1"
+__version__ = "1.2"
 
 DEFAULT_QUALITY = 40
 OVERVIEW_LEVELS = (2, 4, 8, 16, 32, 64, 128, 256, 512)
@@ -197,18 +197,22 @@ def _zip_files(zip_path: Path, entries: list[tuple[Path, str, int]],
             partial.unlink(missing_ok=True)
 
 
-def create_package(result_tif, segment_tif, zip_path,
+def create_package(result_tif_path, segment_tif_path, zip_path,
                    quality: int = DEFAULT_QUALITY,
                    reporter: Reporter | None = None) -> Path:
     """Optimize the orthomosaic, then zip it with the untouched sprayfile.
     Returns the final zip path."""
     rep = reporter or Reporter()
-    result_tif = Path(result_tif)
-    segment_tif = Path(segment_tif)
+    result_tif = Path(result_tif_path)
+    result_tfw = result_tif.with_suffix(".tfw")
+    result_prj = result_tif.with_suffix(".prj")
+    segment_tif = Path(segment_tif_path)
+    segment_tfw = segment_tif.with_suffix(".tfw")
     zip_path = Path(zip_path)
 
     for label, path in (("Orthomosaic (Result)", result_tif),
-                        ("Sprayfile (Segment)", segment_tif)):
+                        ("Sprayfile (Segment)", segment_tif),
+                        ("Sprayfile world file (Segment.tfw)", segment_tfw)):
         if not path.is_file():
             raise FileNotFoundError(f"{label} not found: {path}")
     if result_tif.resolve() == segment_tif.resolve():
@@ -252,11 +256,16 @@ def create_package(result_tif, segment_tif, zip_path,
             _build_overviews(optimized, levels, plan, rep)
 
         rep.phase(3, 3, "WRITE PACKAGE", zip_path.name)
-        _zip_files(zip_path, [
+        entries = [
             # already JPEG-compressed; deflating again wastes minutes for ~1%
             (optimized, result_name, zipfile.ZIP_STORED),
             (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
-        ], rep)
+            (segment_tfw, segment_tfw.name, zipfile.ZIP_STORED),
+        ]
+        for sidecar in (result_tfw, result_prj):
+            if sidecar.is_file():
+                entries.append((sidecar, sidecar.name, zipfile.ZIP_STORED))
+        _zip_files(zip_path, entries, rep)
 
     rep.log(f"package ready: {zip_path.name}"
             f"  {format_size(zip_path.stat().st_size)}")
