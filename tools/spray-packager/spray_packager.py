@@ -204,10 +204,10 @@ def create_package(result_tif_path, segment_tif_path, zip_path,
     Returns the final zip path."""
     rep = reporter or Reporter()
     result_tif = Path(result_tif_path)
-    result_tfw = Path(f"{result_tif_path[0:len(result_tif_path)-4]}.tfw")
-    result_prj = Path(f"{result_tif_path[0:len(result_tif_path)-4]}.prj")
+    result_tfw = result_tif.with_suffix(".tfw")
+    result_prj = result_tif.with_suffix(".prj")
     segment_tif = Path(segment_tif_path)
-    segment_tfw = Path(f"{segment_tif_path[0:len(segment_tif_path)-4]}.tfw")
+    segment_tfw = segment_tif.with_suffix(".tfw")
     zip_path = Path(zip_path)
 
     for label, path in (("Orthomosaic (Result)", result_tif),
@@ -255,14 +255,15 @@ def create_package(result_tif_path, segment_tif_path, zip_path,
             _build_overviews(optimized, levels, plan, rep)
 
         rep.phase(3, 3, "WRITE PACKAGE", zip_path.name)
-        _zip_files(zip_path, [
+        entries = [
             # already JPEG-compressed; deflating again wastes minutes for ~1%
             (optimized, result_name, zipfile.ZIP_STORED),
-            (result_tfw, result_tfw.name, zipfile.ZIP_DEFLATED),
-            (result_prj, result_prj.name, zipfile.ZIP_DEFLATED),
             (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
-            (segment_tfw, segment_tfw.name, zipfile.ZIP_DEFLATED),
-        ], rep)
+        ]
+        for sidecar in (result_tfw, result_prj, segment_tfw):
+            if sidecar.is_file():
+                entries.append((sidecar, sidecar.name, zipfile.ZIP_STORED))
+        _zip_files(zip_path, entries, rep)
 
     rep.log(f"package ready: {zip_path.name}"
             f"  {format_size(zip_path.stat().st_size)}")
