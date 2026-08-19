@@ -211,7 +211,8 @@ def create_package(result_tif_path, segment_tif_path, zip_path,
     zip_path = Path(zip_path)
 
     for label, path in (("Orthomosaic (Result)", result_tif),
-                        ("Sprayfile (Segment)", segment_tif)):
+                        ("Sprayfile (Segment)", segment_tif),
+                        ("Sprayfile world file (Segment.tfw)", segment_tfw)):
         if not path.is_file():
             raise FileNotFoundError(f"{label} not found: {path}")
     if result_tif.resolve() == segment_tif.resolve():
@@ -259,8 +260,9 @@ def create_package(result_tif_path, segment_tif_path, zip_path,
             # already JPEG-compressed; deflating again wastes minutes for ~1%
             (optimized, result_name, zipfile.ZIP_STORED),
             (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
+            (segment_tfw, segment_tfw.name, zipfile.ZIP_STORED),
         ]
-        for sidecar in (result_tfw, result_prj, segment_tfw):
+        for sidecar in (result_tfw, result_prj):
             if sidecar.is_file():
                 entries.append((sidecar, sidecar.name, zipfile.ZIP_STORED))
         _zip_files(zip_path, entries, rep)

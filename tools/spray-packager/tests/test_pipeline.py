@@ -70,6 +70,12 @@ def make_segment(path: Path, size=200) -> None:
             path, "w", driver="GTiff", width=size, height=size, count=1,
             dtype="uint8", crs=CRS, transform=transform) as dst:
         dst.write(data)
+    # segment_tfw is required downstream; write a matching ESRI world file
+    a, b, c, d, e, f = (transform.a, transform.b, transform.c,
+                        transform.d, transform.e, transform.f)
+    tfw_path = path.with_suffix(".tfw")
+    tfw_path.write_text(
+        f"{a}\n{b}\n{d}\n{e}\n{c + a / 2}\n{f + e / 2}\n")
 
 
 def sha256(path: Path) -> str:
@@ -93,15 +99,18 @@ def test_create_package() -> None:
 
         with zipfile.ZipFile(out_zip) as zf:
             names = sorted(zf.namelist())
-            assert names == ["Result.tif", "Segment.tif"], names
+            assert names == ["Result.tif", 'Segment.tfw', "Segment.tif"], names
             infos = {i.filename: i for i in zf.infolist()}
             assert infos["Result.tif"].compress_type == zipfile.ZIP_STORED
+            assert infos["Segment.tfw"].compress_type == zipfile.ZIP_STORED
             assert infos["Segment.tif"].compress_type == zipfile.ZIP_DEFLATED
             extract_dir = tmp / "extracted"
             zf.extractall(extract_dir)
 
         assert sha256(extract_dir / "Segment.tif") == segment_hash, \
             "sprayfile was modified"
+        assert (extract_dir / "Segment.tfw").read_text() == segment.with_suffix(".tfw").read_text(), \
+            "segment world file was modified"
 
         with rasterio.open(extract_dir / "Result.tif") as ds:
             assert ds.width == 1024 and ds.height == 768
@@ -123,6 +132,23 @@ def test_create_package() -> None:
 
     print("PASS: create_package end-to-end")
 
+def test_missing_segment_tfw_raises() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        result = tmp / "Result.tif"
+        segment = tmp / "Segment.tif"
+        make_ortho(result)
+        make_segment(segment)
+        segment.with_suffix(".tfw").unlink()  # remove the required sidecar
+
+        try:
+            create_package(result, segment, tmp / "pkg.zip")
+        except FileNotFoundError as e:
+            assert "Segment.tfw" in str(e) or "world file" in str(e), e
+        else:
+            raise AssertionError("expected FileNotFoundError for missing segment.tfw")
+
+    print("PASS: missing segment.tfw raises")
 
 def test_non_uint8_falls_back_to_deflate() -> None:
     with tempfile.TemporaryDirectory() as tmp:
@@ -236,4 +262,5 @@ if __name__ == "__main__":
     test_non_uint8_falls_back_to_deflate()
     test_rgba_uses_ycbcr_and_mask()
     test_cli_return_codes()
+    test_missing_segment_tfw_raises()
     print("All tests passed.")
