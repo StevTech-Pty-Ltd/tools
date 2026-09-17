@@ -222,6 +222,20 @@ def create_package(result_tif, segment_tif, zip_path,
     if result_name == segment_name:
         segment_name = f"{segment_tif.stem}_segment{segment_tif.suffix}"
 
+    # Preserve external georeferencing as well as the segment pixels. Terra
+    # masks may have no embedded transform, so losing the world file makes the
+    # package impossible to align safely downstream.
+    sidecars = []
+    for suffix in (".tfw", ".tifw", ".prj"):
+        expected = (segment_tif.stem + suffix).lower()
+        matches = [p for p in segment_tif.parent.iterdir()
+                   if p.is_file() and p.name.lower() == expected]
+        if len(matches) > 1:
+            raise ValueError(f"Ambiguous segment georeferencing: {expected}")
+        if matches:
+            sidecars.append((matches[0], Path(segment_name).stem + suffix,
+                             zipfile.ZIP_DEFLATED))
+
     with rasterio.open(result_tif) as src:
         width, height = src.width, src.height
         bands = src.count
@@ -256,6 +270,7 @@ def create_package(result_tif, segment_tif, zip_path,
             # already JPEG-compressed; deflating again wastes minutes for ~1%
             (optimized, result_name, zipfile.ZIP_STORED),
             (segment_tif, segment_name, zipfile.ZIP_DEFLATED),
+            *sidecars,
         ], rep)
 
     rep.log(f"package ready: {zip_path.name}"

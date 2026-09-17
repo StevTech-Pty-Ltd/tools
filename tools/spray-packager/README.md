@@ -75,6 +75,9 @@ Set `SPK_DEBUG=1` for a full traceback on failure.
 | Overviews | Averaged pyramids, levels 2–512 capped to the image size, JPEG-compressed |
 | Fallback | Non-8-bit input uses lossless DEFLATE instead of failing |
 
+Existing segment world files (`.tfw` / `.tifw`) and projection files (`.prj`)
+are included unchanged. Missing georeferencing is never invented.
+
 The sprayfile is never recompressed — it goes into the zip byte-for-byte. The
 optimized orthomosaic is `STORED` in the zip (it is already JPEG-compressed;
 deflating it again would waste minutes for ~1% saving).

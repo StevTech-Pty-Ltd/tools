@@ -231,8 +231,25 @@ def test_rgba_uses_ycbcr_and_mask() -> None:
     print("PASS: RGBA uses YCbCr + mask")
 
 
+def test_segment_world_file_is_preserved() -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        tmp = Path(directory)
+        result, segment = tmp / "Result.tif", tmp / "Segment.tif"
+        make_ortho(result, 64, 64)
+        make_segment(segment)
+        world = b"0.5\n0\n0\n-0.5\n500000.25\n5999999.75\n"
+        (tmp / "SEGMENT.TFW").write_bytes(world)
+        (tmp / "Segment.prj").write_text("source coordinate reference")
+        output = create_package(result, segment, tmp / "out.zip")
+        with zipfile.ZipFile(output) as archive:
+            assert archive.read("Segment.tfw") == world
+            assert archive.read("Segment.prj") == b"source coordinate reference"
+            assert archive.read("Segment.tif") == segment.read_bytes()
+
+
 if __name__ == "__main__":
     test_create_package()
+    test_segment_world_file_is_preserved()
     test_non_uint8_falls_back_to_deflate()
     test_rgba_uses_ycbcr_and_mask()
     test_cli_return_codes()
