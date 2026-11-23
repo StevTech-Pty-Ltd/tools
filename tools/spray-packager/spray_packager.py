@@ -101,12 +101,12 @@ def prepare_portal_raster(source: Path, destination: Path) -> Path:
             output = Path(staging) / source.name
             with rasterio.Env(GDAL_TIFF_INTERNAL_MASK="YES"):
                 copy_raster(src, str(output), driver="GTiff", strict=True,
-                            COMPRESS="ZSTD", ZSTD_LEVEL=3, PREDICTOR=2,
+                            COMPRESS="DEFLATE", ZLEVEL=1, PREDICTOR=2,
                             TILED="YES", BIGTIFF="IF_SAFER", NUM_THREADS="4",
                             COPY_SRC_OVERVIEWS="YES", COPY_SRC_MDD="YES")
             with rasterio.open(output) as prepared:
                 if ({Path(file).resolve() for file in prepared.files} != {output.resolve()}
-                        or prepared.compression is None or prepared.compression.value.upper() != "ZSTD"
+                        or prepared.compression is None or prepared.compression.value.upper() != "DEFLATE"
                         or _raster_metadata(src) != _raster_metadata(prepared)):
                     raise ValueError("Use the original file to retain its GeoTIFF metadata.")
             current_stat = source.stat()
