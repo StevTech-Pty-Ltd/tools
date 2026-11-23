@@ -32,7 +32,8 @@ ZIP_CHUNK = 8 * 1024 * 1024
 try:
     import numpy as np
     import rasterio
-    from rasterio.enums import Resampling
+    from rasterio.enums import ColorInterp, Resampling
+    from rasterio.shutil import copy as copy_raster
     from rasterio.windows import Window
 
     RASTERIO_IMPORT_ERROR = None
@@ -77,6 +78,63 @@ def format_duration(seconds: float) -> str:
 # --------------------------------------------------------------------------
 # Core pipeline (no GUI imports)
 # --------------------------------------------------------------------------
+
+def prepare_portal_raster(source: Path, destination: Path) -> Path:
+    """Make a smaller, full-resolution GeoTIFF for a new Portal upload."""
+    source = source.resolve(strict=True)
+    destination = destination.resolve(strict=True)
+    if source.suffix.lower() not in (".tif", ".tiff"):
+        raise ValueError("Select a GeoTIFF.")
+    if not destination.is_dir():
+        raise ValueError("Choose an output folder.")
+
+    source_stat = source.stat()
+    with rasterio.open(source) as src:
+        if src.driver != "GTiff" or {Path(file).resolve() for file in src.files} != {source}:
+            raise ValueError("Use the original GeoTIFF and its sidecars for this upload.")
+        rgb = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)
+        supported_bands = (rgb, (*rgb, ColorInterp.alpha))
+        if (src.crs is None or src.gcps[0] or src.rpcs is not None
+                or set(src.dtypes) != {"uint8"} or src.colorinterp not in supported_bands):
+            raise ValueError("Choose an 8-bit RGB or RGBA orthomosaic with embedded georeferencing.")
+        with tempfile.TemporaryDirectory(prefix=".portal-prep-", dir=destination) as staging:
+            output = Path(staging) / source.name
+            with rasterio.Env(GDAL_TIFF_INTERNAL_MASK="YES"):
+                copy_raster(src, str(output), driver="GTiff", strict=True,
+                            COMPRESS="ZSTD", ZSTD_LEVEL=3, PREDICTOR=2,
+                            TILED="YES", BIGTIFF="IF_SAFER", NUM_THREADS="4",
+                            COPY_SRC_OVERVIEWS="YES", COPY_SRC_MDD="YES")
+            with rasterio.open(output) as prepared:
+                if ({Path(file).resolve() for file in prepared.files} != {output.resolve()}
+                        or prepared.compression is None or prepared.compression.value.upper() != "ZSTD"
+                        or _raster_metadata(src) != _raster_metadata(prepared)):
+                    raise ValueError("Use the original file to retain its GeoTIFF metadata.")
+            current_stat = source.stat()
+            if (source_stat.st_size, source_stat.st_mtime_ns) != (
+                    current_stat.st_size, current_stat.st_mtime_ns):
+                raise ValueError("The TIFF changed during preparation. Try again once it is ready.")
+            if output.stat().st_size >= source_stat.st_size:
+                raise ValueError("This file is already compact. Upload the original.")
+            folder = Path(tempfile.mkdtemp(prefix="Portal-upload-", dir=destination))
+            try:
+                return output.rename(folder / source.name)
+            except OSError:
+                folder.rmdir()
+                raise
+
+
+def _raster_metadata(dataset) -> tuple:
+    namespaces = set(dataset.tag_namespaces()) - {"IMAGE_STRUCTURE", "DERIVED_SUBDATASETS"}
+    tags = {namespace: dataset.tags(ns=namespace) for namespace in namespaces}
+    band_tags = tuple(dataset.tags(band) for band in dataset.indexes)
+    overviews = tuple(dataset.overviews(band) for band in dataset.indexes)
+    # GDAL can return NaN as a nodata marker. Its string form compares stably.
+    nodata = tuple(str(value) for value in dataset.nodatavals)
+    return (dataset.shape, dataset.dtypes, dataset.crs, dataset.transform,
+            dataset.colorinterp, dataset.mask_flag_enums, nodata, dataset.scales,
+            dataset.offsets, dataset.units, dataset.descriptions, dataset.tags(),
+            tags, band_tags, overviews)
+
 
 def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
     """Creation options matching the old optimize_raster.sh treatment.
@@ -408,6 +466,9 @@ def run_gui() -> None:
     run_button.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(10, 6),
                     ipady=6)
 
+    prepare_button = ttk.Button(quality_frame, text="Prepare lossless Portal TIFF")
+    prepare_button.pack(side="left", padx=(16, 0))
+
     progress_bar = ttk.Progressbar(outer, maximum=100)
     progress_bar.grid(row=5, column=0, columnspan=3, sticky="ew")
     ttk.Label(outer, textvariable=status_var).grid(
@@ -442,6 +503,7 @@ def run_gui() -> None:
         state = "disabled" if busy else "normal"
         run_button.configure(state=state)
         quality_box.configure(state=state)
+        prepare_button.configure(state=state)
 
     def worker(result: str, segment: str, zip_path: str, quality: int) -> None:
         try:
@@ -489,7 +551,29 @@ def run_gui() -> None:
                          args=(result, segment, zip_path, quality),
                          daemon=True).start()
 
+    def prepare_worker(source: Path, folder: Path) -> None:
+        try:
+            ui_queue.put(("prepared", str(prepare_portal_raster(source, folder))))
+        except Exception:
+            ui_queue.put(("error", traceback.format_exc()))
+
+    def on_prepare() -> None:
+        source = Path(result_var.get().strip())
+        if not source.is_file():
+            messagebox.showwarning("Select a GeoTIFF", "Choose the TIFF in the first field.")
+            return
+        folder = filedialog.askdirectory(title="Save prepared TIFF in", mustexist=True)
+        if folder:
+            set_busy(True)
+            progress_bar["value"] = 0
+            status_var.set("Preparing full-resolution TIFF...")
+            progress_bar.configure(mode="indeterminate")
+            progress_bar.start(15)
+            threading.Thread(target=prepare_worker, args=(source, Path(folder)),
+                             daemon=True).start()
+
     run_button.configure(command=on_run)
+    prepare_button.configure(command=on_prepare)
 
     def poll_queue() -> None:
         try:
@@ -529,7 +613,23 @@ def run_gui() -> None:
                             f"Created {out.name}\n({format_size(out.stat().st_size)})\n\n"
                             "Open the folder it was saved in?"):
                         open_folder(out.parent)
+                elif kind == "prepared":
+                    progress_bar.stop()
+                    progress_bar.configure(mode="determinate")
+                    progress_bar["value"] = 100
+                    status_var.set("TIFF ready for a new upload.")
+                    out = Path(str(payload))
+                    append_log(f"PREPARED  {out.name}  {format_size(out.stat().st_size)}")
+                    set_busy(False)
+                    if messagebox.askyesno(
+                            "TIFF ready",
+                            "Use this TIFF and the other original files for a new upload. "
+                            "For a resume, reselect the exact files you originally uploaded.\n\n"
+                            "Open the prepared TIFF folder?"):
+                        open_folder(out.parent)
                 elif kind == "error":
+                    progress_bar.stop()
+                    progress_bar.configure(mode="determinate")
                     detail = str(payload)
                     append_log(detail)
                     last_line = detail.strip().splitlines()[-1]
@@ -567,7 +667,20 @@ def main(argv=None) -> None:
     parser.add_argument("--zip", dest="zip_path", help="Output zip path")
     parser.add_argument("--quality", type=int, default=DEFAULT_QUALITY,
                         help=f"JPEG quality (default {DEFAULT_QUALITY})")
+    parser.add_argument("--portal-folder", type=Path,
+                        help="Prepare a lossless TIFF in this folder for a new upload")
     args = parser.parse_args(argv)
+
+    if args.portal_folder:
+        if not args.result or args.segment or args.zip_path:
+            parser.error("--portal-folder requires --result as its only input")
+        try:
+            if RASTERIO_IMPORT_ERROR is not None:
+                raise RuntimeError(f"rasterio failed to import: {RASTERIO_IMPORT_ERROR}")
+            print(prepare_portal_raster(Path(args.result), args.portal_folder))
+        except (OSError, ValueError, RuntimeError) as error:
+            parser.exit(4, f"{error}\n")
+        return
 
     if args.result or args.segment or args.zip_path:
         if not (args.result and args.segment and args.zip_path):

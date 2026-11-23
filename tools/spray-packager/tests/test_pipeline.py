@@ -25,7 +25,7 @@ from rasterio.transform import from_origin
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from spray_packager import create_package  # noqa: E402
+from spray_packager import create_package, prepare_portal_raster  # noqa: E402
 
 CRS = "EPSG:32755"
 
@@ -257,10 +257,53 @@ def test_rgba_uses_ycbcr_and_mask() -> None:
     print("PASS: RGBA uses YCbCr + mask")
 
 
+def test_lossless_portal_preparation() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        source = Path(tmp) / "result.tif"
+        make_ortho_rgba(source)
+        with rasterio.open(source, "r+") as ds:
+            alpha = ds.read(4)
+            alpha[:, 450:470] //= 2
+            ds.write(alpha, 4)
+            ds.update_tags(delivery="Portal")
+            ds.build_overviews([2, 4], rasterio.enums.Resampling.average)
+        original_hash = sha256(source)
+
+        prepared = prepare_portal_raster(source, Path(tmp))
+        assert prepared.name == source.name
+        assert prepared.parent != source.parent
+        assert prepared.stat().st_size < source.stat().st_size
+        assert sha256(source) == original_hash
+        with rasterio.open(source) as original, rasterio.open(prepared) as delivery:
+            np.testing.assert_array_equal(original.read(), delivery.read())
+            np.testing.assert_array_equal(original.read_masks(), delivery.read_masks())
+            assert original.crs == delivery.crs and original.transform == delivery.transform
+            assert delivery.tags()["delivery"] == "Portal"
+            assert delivery.overviews(1) == [2, 4]
+        with rasterio.open(source, OVERVIEW_LEVEL=0) as original, rasterio.open(
+                prepared, OVERVIEW_LEVEL=0) as delivery:
+            np.testing.assert_array_equal(original.read(), delivery.read())
+
+        with rasterio.Env(GDAL_TIFF_INTERNAL_MASK="NO"):
+            with rasterio.open(source, "r+") as ds:
+                ds.write_mask(np.full(ds.shape, 255, dtype=np.uint8))
+        try:
+            prepare_portal_raster(source, Path(tmp))
+        except ValueError as exc:
+            assert "sidecars" in str(exc)
+        else:
+            raise AssertionError("Preparation must retain TIFFs with external masks as originals")
+        assert list(Path(tmp).glob("Portal-upload-*")) == [prepared.parent]
+        assert not list(Path(tmp).glob(".portal-prep-*"))
+
+    print("PASS: lossless Portal preparation preserves source, pixels, masks and overviews")
+
+
 if __name__ == "__main__":
     test_create_package()
     test_non_uint8_falls_back_to_deflate()
     test_rgba_uses_ycbcr_and_mask()
     test_cli_return_codes()
     test_missing_segment_tfw_raises()
+    test_lossless_portal_preparation()
     print("All tests passed.")

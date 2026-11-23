@@ -22,6 +22,19 @@ No GDAL or other software install needed — everything ships inside the app.
 If Windows shows a "Windows protected your PC" warning, click
 **More info → Run anyway** — the tools are not yet code-signed.
 
+## Preparing a full-resolution TIFF for a new Portal upload
+
+Choose the original RGB or RGBA orthomosaic in the first field, then click
+**Prepare lossless Portal TIFF**. Choose where to save it and select the prepared
+TIFF alongside the other original files when starting a new upload. Preparation
+preserves image samples and georeferencing and keeps the original file on disk.
+TIFFs with external metadata or masks and TIFFs that are already compact can
+be uploaded as originals. A resumed upload requires the exact files selected
+when it started.
+
+The **Create Package** button produces the JPEG-compressed spray ZIP for the
+existing sprayfile workflow.
+
 ## Running from source (any platform)
 
 ```bash
@@ -29,6 +42,12 @@ python3 -m venv .venv
 source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 python spray_packager.py           # GUI
+```
+
+Lossless preparation from the command line:
+
+```bash
+python spray_packager.py --result Result.tif --portal-folder /path/to/output
 ```
 
 Headless / scripted use (retro terminal UI — live progress bars, ETAs, and a
