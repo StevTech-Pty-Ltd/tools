@@ -136,10 +136,10 @@ def _raster_metadata(dataset) -> tuple:
             tags, band_tags, overviews)
 
 
-def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
+def _plan_options(colorinterp: tuple, dtype: str, quality: int, rep: Reporter) -> dict:
     """Creation options matching the old optimize_raster.sh treatment.
 
-    A 4-band uint8 raster is DJI Terra's RGB + alpha. JPEG cannot use the
+    DJI Terra RGB + alpha has explicit band interpretations. JPEG cannot use the
     efficient YCbCr colour transform on 4 bands, so those orthos compress
     several times worse if left as-is. We instead write the 3 colour bands as
     YCbCr JPEG and carry the alpha as an internal 1-bit mask (transparency is
@@ -147,18 +147,15 @@ def _plan_options(count: int, dtype: str, quality: int, rep: Reporter) -> dict:
     """
     options = {"tiled": True, "blockxsize": 256, "blockysize": 256,
                "bigtiff": "YES"}
-    out_count, use_mask = count, False
-    if dtype == "uint8":
-        options.update(compress="JPEG", JPEG_QUALITY=str(quality))
-        if count == 4:
+    rgb = (ColorInterp.red, ColorInterp.green, ColorInterp.blue)
+    rgba = (*rgb, ColorInterp.alpha)
+    out_count, use_mask = len(colorinterp), False
+    if dtype == "uint8" and colorinterp in (rgb, rgba):
+        options.update(compress="JPEG", JPEG_QUALITY=str(quality), photometric="YCbCr")
+        if colorinterp == rgba:
             out_count, use_mask = 3, True
-            options["photometric"] = "YCbCr"
-        elif count == 3:
-            options["photometric"] = "YCbCr"
     else:
-        # JPEG compression only exists for 8-bit data; fail soft into lossless.
-        rep.log(f"NOTE image is {dtype}, not 8-bit; JPEG does not apply. "
-                "Falling back to lossless DEFLATE.")
+        rep.log("Using lossless DEFLATE for imagery outside 8-bit RGB and RGBA.")
         options.update(compress="DEFLATE",
                        predictor=3 if dtype.startswith("float") else 2)
     return {"options": options, "out_count": out_count, "use_mask": use_mask}
@@ -169,17 +166,19 @@ def _compress_windowed(src_path: Path, dst_path: Path, quality: int,
     """Rewrite the raster tile-by-tile with the planned creation options.
 
     Windowed copying (vs GDAL CreateCopy) measures within ~2% at scale and
-    buys two things: real byte progress, and the nodata flag is simply never
-    written -- the equivalent of gdal_translate -a_nodata none. Returns the
+    reports real byte progress. JPEG removes the nodata flag to avoid speckling.
+    The lossless path keeps the nodata value. Returns the
     plan dict (options + mask flag) that overview building needs.
     """
     with rasterio.open(src_path) as src:
-        plan = _plan_options(src.count, src.dtypes[0], quality, rep)
+        plan = _plan_options(src.colorinterp, src.dtypes[0], quality, rep)
         options, out_count, use_mask = (
             plan["options"], plan["out_count"], plan["use_mask"])
         profile = dict(driver="GTiff", width=src.width, height=src.height,
                        count=out_count, dtype=src.dtypes[0], crs=src.crs,
-                       transform=src.transform, nodata=None, **options)
+                       transform=src.transform,
+                       nodata=None if options["compress"] == "JPEG" else src.nodata,
+                       **options)
         pixel_bytes = src.count * np.dtype(src.dtypes[0]).itemsize
         total = src.width * src.height * pixel_bytes
         # Strips of whole tile-rows, sized ~64 MB raw, keep Python overhead

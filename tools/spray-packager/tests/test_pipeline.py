@@ -158,7 +158,7 @@ def test_non_uint8_falls_back_to_deflate() -> None:
         data = np.random.default_rng(1).random((1, 300, 300)).astype("float32")
         with rasterio.open(
                 result, "w", driver="GTiff", width=300, height=300, count=1,
-                dtype="float32", crs=CRS, transform=transform) as dst:
+                dtype="float32", crs=CRS, transform=transform, nodata=-9999) as dst:
             dst.write(data)
         segment = tmp / "Segment.tif"
         make_segment(segment)
@@ -168,6 +168,8 @@ def test_non_uint8_falls_back_to_deflate() -> None:
             zf.extractall(tmp / "x")
         with rasterio.open(tmp / "x" / "Result.tif") as ds:
             assert ds.compression.value.lower() == "deflate", ds.compression
+            assert ds.nodata == -9999
+            np.testing.assert_array_equal(ds.read(), data)
             assert ds.overviews(1), "no overviews built"
 
     print("PASS: non-uint8 fallback to DEFLATE")
@@ -293,10 +295,27 @@ def test_lossless_portal_preparation() -> None:
             assert "sidecars" in str(exc)
         else:
             raise AssertionError("Preparation must retain TIFFs with external masks as originals")
-        assert list(Path(tmp).glob("Portal-upload-*")) == [prepared.parent]
+        assert [path.name for path in Path(tmp).glob("Portal-upload-*")] == [prepared.parent.name]
         assert not list(Path(tmp).glob(".portal-prep-*"))
 
     print("PASS: lossless Portal preparation preserves source, pixels, masks and overviews")
+
+
+def test_non_rgb_8_bit_bands_remain_data() -> None:
+    with tempfile.TemporaryDirectory() as tmp:
+        tmp = Path(tmp)
+        result, segment = tmp / "Result.tif", tmp / "Segment.tif"
+        make_ortho_rgba(result)
+        make_segment(segment)
+        with rasterio.open(result, "r+") as ds:
+            ds.colorinterp = (rasterio.enums.ColorInterp.undefined,) * 4
+            expected = ds.read()
+        package = create_package(result, segment, tmp / "pkg.zip")
+        with zipfile.ZipFile(package) as archive:
+            with rasterio.MemoryFile(archive.read("Result.tif")) as file, file.open() as ds:
+                assert ds.compression.value.lower() == "deflate"
+                np.testing.assert_array_equal(ds.read(), expected)
+    print("PASS: non-RGB byte bands remain data")
 
 
 if __name__ == "__main__":
@@ -306,4 +325,5 @@ if __name__ == "__main__":
     test_cli_return_codes()
     test_missing_segment_tfw_raises()
     test_lossless_portal_preparation()
+    test_non_rgb_8_bit_bands_remain_data()
     print("All tests passed.")

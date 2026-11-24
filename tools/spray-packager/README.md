@@ -90,9 +90,9 @@ Set `SPK_DEBUG=1` for a full traceback on failure.
 | Step | Setting |
 |---|---|
 | Compression | `COMPRESS=JPEG`, quality 40 (adjustable), `TILED=YES`, `BIGTIFF=YES`; `PHOTOMETRIC=YCBCR` for 3-band images |
-| Nodata | Flag removed (avoids transparent speckle after lossy compression) |
+| Nodata | Preserved on the lossless path and removed for JPEG |
 | Overviews | Averaged pyramids, levels 2–512 capped to the image size, JPEG-compressed |
-| Fallback | Non-8-bit input uses lossless DEFLATE instead of failing |
+| Fallback | Inputs outside 8-bit RGB and RGBA use lossless DEFLATE |
 
 The sprayfile is never recompressed — it goes into the zip byte-for-byte. The
 optimized orthomosaic is `STORED` in the zip (it is already JPEG-compressed;
